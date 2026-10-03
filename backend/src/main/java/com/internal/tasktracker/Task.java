@@ -32,6 +32,14 @@ public class Task {
     @Column(name = "created_at")
     private LocalDateTime createdAt;
 
+    // Ensure new tasks always get a timestamp (list ordering depends on it).
+    @PrePersist
+    void onCreate() {
+        if (createdAt == null) {
+            createdAt = LocalDateTime.now();
+        }
+    }
+
     public Long getId() { return id; }
     public void setId(Long id) { this.id = id; }
 

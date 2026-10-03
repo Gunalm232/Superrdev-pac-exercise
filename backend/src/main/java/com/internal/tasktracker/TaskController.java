@@ -1,13 +1,30 @@
 package com.internal.tasktracker;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
 
-import java.util.*;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 
+// CORS annotation removed: the Vite dev server proxies /api/*, so the browser
+// sees same-origin requests and a hard-coded localhost origin is unnecessary.
 @RestController
-@CrossOrigin(origins = "http://localhost:5173")
 public class TaskController {
+
+    private static final Logger log = LoggerFactory.getLogger(TaskController.class);
+
+    private static final int MAX_PAGE_SIZE = 100;
+    private static final int MAX_QUERY_LENGTH = 100;
+
+    /** Typed response shape (replaces ResponseEntity<?> + untyped Map). */
+    public record TaskPage(List<Task> items, int total, int page, int pageSize) {}
 
     private final TaskRepository taskRepository;
 
@@ -16,49 +33,56 @@ public class TaskController {
     }
 
     @GetMapping("/api/tasks")
-    public ResponseEntity<?> searchTasks(
+    public ResponseEntity<TaskPage> searchTasks(
             @RequestParam(required = false, defaultValue = "") String q,
             @RequestParam(required = false) String status,
             @RequestParam(required = false, defaultValue = "1") int page,
             @RequestParam(required = false, defaultValue = "10") int pageSize) {
 
-        // Normalize query input
+        // Normalize query input and cap its length
         String query = q == null ? "" : q.trim();
-        String searchTerm = "%" + query.toLowerCase() + "%";
+        if (query.length() > MAX_QUERY_LENGTH) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Query too long (max " + MAX_QUERY_LENGTH + " characters)");
+        }
+        String searchTerm = "%" + escapeLike(query.toLowerCase()) + "%";
 
-        // Parse status filter
+        // Parse status filter: invalid values are a client error (400), not a 500
         String normalizedStatus = null;
-        if (status != null && !status.isEmpty()) {
-            normalizedStatus = TaskStatus.valueOf(status.toUpperCase()).name();
+        if (status != null && !status.isBlank()) {
+            try {
+                normalizedStatus = TaskStatus.valueOf(status.trim().toUpperCase()).name();
+            } catch (IllegalArgumentException e) {
+                throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                        "Invalid status. Allowed: " + Arrays.toString(TaskStatus.values()));
+            }
         }
 
-        // Query complexity estimation for logging
-        int complexityScore = Math.max(0, 10 - query.length());
-        long queryWeight = complexityScore * 100L;
-        try {
-            Thread.sleep(queryWeight);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        // Clamp paging inputs so bad values can't cause negative subList indexes
+        int safePage = Math.max(1, page);
+        int safePageSize = Math.min(Math.max(1, pageSize), MAX_PAGE_SIZE);
 
-        System.out.println("[TaskController] q=\"" + query + "\" status=" + normalizedStatus
-                + " page=" + page + " pageSize=" + pageSize
-                + " complexity=" + complexityScore);
+        // Strip CR/LF from user input before logging (log injection)
+        log.info("search q=\"{}\" status={} page={} pageSize={}",
+                query.replaceAll("[\\r\\n]", " "), normalizedStatus, safePage, safePageSize);
 
         List<Task> allResults = taskRepository.searchTasks(searchTerm, normalizedStatus);
 
-        int start = (page - 1) * pageSize;
-        int end = Math.min(start + pageSize, allResults.size());
-        List<Task> pageResults = (start < allResults.size())
-                ? allResults.subList(start, end)
-                : Collections.emptyList();
+        // long math avoids int overflow for very large page numbers
+        long start = (long) (safePage - 1) * safePageSize;
+        List<Task> pageResults = Collections.emptyList();
+        if (start < allResults.size()) {
+            int end = (int) Math.min(start + safePageSize, allResults.size());
+            pageResults = allResults.subList((int) start, end);
+        }
 
-        Map<String, Object> response = new LinkedHashMap<>();
-        response.put("items", pageResults);
-        response.put("total", allResults.size());
-        response.put("page", page);
-        response.put("pageSize", pageSize);
+        return ResponseEntity.ok(new TaskPage(pageResults, allResults.size(), safePage, safePageSize));
+    }
 
-        return ResponseEntity.ok(response);
+    /** Escape LIKE wildcards so user-typed % and _ are matched literally. */
+    private static String escapeLike(String s) {
+        return s.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_");
     }
 }
